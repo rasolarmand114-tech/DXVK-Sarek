@@ -1,17 +1,49 @@
 #pragma once
 
+#include <unordered_map>
+
 #include "dxvk_adapter.h"
 
+// Guard against VMA_IMPLEMENTATION being defined project-wide (e.g. via
+// a global compiler flag in the build system) and pulling the full VMA
+// function bodies into every translation unit that includes this header.
+// Only dxvk_memory.cpp is allowed to provide the real implementation,
+// signalled by VMA_DXVK_IMPLEMENTATION; everyone else only ever gets
+// declarations, which is what a single-header library like VMA requires
+// to avoid duplicate-symbol errors at link time.
+#if defined(VMA_IMPLEMENTATION) && !defined(VMA_DXVK_IMPLEMENTATION)
+  #undef VMA_IMPLEMENTATION
+#endif
+
+// This project loads all Vulkan entry points dynamically through its own
+// vk::InstanceFn / vk::DeviceFn wrappers and never links against the
+// Vulkan loader (vulkan-1 / libvulkan) directly. By default VMA expects
+// to either link those symbols statically (VMA_STATIC_VULKAN_FUNCTIONS)
+// or fetch them itself via vkGetInstanceProcAddr/vkGetDeviceProcAddr
+// (VMA_DYNAMIC_VULKAN_FUNCTIONS), both of which fail for us at link time.
+// Disabling both forces VMA to use exclusively the function pointers we
+// hand it through VmaAllocatorCreateInfo::pVulkanFunctions.
+#ifndef VMA_STATIC_VULKAN_FUNCTIONS
+  #define VMA_STATIC_VULKAN_FUNCTIONS 0
+#endif
+
+#ifndef VMA_DYNAMIC_VULKAN_FUNCTIONS
+  #define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
+#endif
+
+#include "../vulkan/vulkan_vma.h" // = vk_mem_alloc.h
+
 namespace dxvk {
-  
+
   class DxvkMemoryAllocator;
-  class DxvkMemoryChunk;
-  
+
   /**
    * \brief Memory stats
-   * 
+   *
    * Reports the amount of device memory
    * allocated and used by the application.
+   * Sourced directly from VMA's per-heap
+   * budget statistics.
    */
   struct DxvkMemoryStats {
     VkDeviceSize memoryAllocated = 0;
@@ -45,146 +77,14 @@ namespace dxvk {
 
 
   /**
-   * \brief Device memory object
-   * 
-   * Stores a Vulkan memory object. If the object
-   * was allocated on host-visible memory, it will
-   * be persistently mapped.
-   */
-  struct DxvkDeviceMemory {
-    VkDeviceMemory        memHandle  = VK_NULL_HANDLE;
-    void*                 memPointer = nullptr;
-    VkDeviceSize          memSize    = 0;
-    VkMemoryPropertyFlags memFlags   = 0;
-    float                 priority   = 0.0f;
-  };
-
-  
-  /**
-   * \brief Memory heap
-   * 
-   * Corresponds to a Vulkan memory heap and stores
-   * its properties as well as allocation statistics.
-   */
-  struct DxvkMemoryHeap {
-    VkMemoryHeap      properties;
-    DxvkMemoryStats   stats;
-    VkDeviceSize      budget;
-  };
-
-
-  /**
-   * \brief Memory type
-   * 
-   * Corresponds to a Vulkan memory type and stores
-   * memory chunks used to sub-allocate memory on
-   * this memory type.
-   */
-  struct DxvkMemoryType {
-    DxvkMemoryHeap*   heap;
-    uint32_t          heapId;
-
-    VkMemoryType      memType;
-    uint32_t          memTypeId;
-
-    std::vector<Rc<DxvkMemoryChunk>> chunks;
-  };
-  
-  
-  /**
-   * \brief Memory slice
-   * 
-   * Represents a slice of memory that has
-   * been sub-allocated from a bigger chunk.
-   */
-  class DxvkMemory {
-    friend class DxvkMemoryAllocator;
-  public:
-    
-    DxvkMemory();
-    DxvkMemory(
-      DxvkMemoryAllocator*  alloc,
-      DxvkMemoryChunk*      chunk,
-      DxvkMemoryType*       type,
-      VkDeviceMemory        memory,
-      VkDeviceSize          offset,
-      VkDeviceSize          length,
-      void*                 mapPtr);
-    DxvkMemory             (DxvkMemory&& other);
-    DxvkMemory& operator = (DxvkMemory&& other);
-    ~DxvkMemory();
-    
-    /**
-     * \brief Memory object
-     * 
-     * This information is required when
-     * binding memory to Vulkan objects.
-     * \returns Memory object
-     */
-    VkDeviceMemory memory() const {
-      return m_memory;
-    }
-    
-    /**
-     * \brief Offset into device memory
-     * 
-     * This information is required when
-     * binding memory to Vulkan objects.
-     * \returns Offset into device memory
-     */
-    VkDeviceSize offset() const {
-      return m_offset;
-    }
-    
-    /**
-     * \brief Pointer to mapped data
-     * 
-     * \param [in] offset Byte offset
-     * \returns Pointer to mapped data
-     */
-    void* mapPtr(VkDeviceSize offset) const {
-      return reinterpret_cast<char*>(m_mapPtr) + offset;
-    }
-
-    /**
-     * \brief Returns length of memory allocated
-     * 
-     * \returns Memory size
-     */
-    VkDeviceSize length() const {
-      return m_length;
-    }
-
-    /**
-     * \brief Checks whether the memory slice is defined
-     * 
-     * \returns \c true if this slice points to actual device
-     *          memory, and \c false if it is undefined.
-     */
-    operator bool () const {
-      return m_memory != VK_NULL_HANDLE;
-    }
-    
-  private:
-    
-    DxvkMemoryAllocator*  m_alloc  = nullptr;
-    DxvkMemoryChunk*      m_chunk  = nullptr;
-    DxvkMemoryType*       m_type   = nullptr;
-    VkDeviceMemory        m_memory = VK_NULL_HANDLE;
-    VkDeviceSize          m_offset = 0;
-    VkDeviceSize          m_length = 0;
-    void*                 m_mapPtr = nullptr;
-    
-    void free();
-    
-  };
-
-
-  /**
    * \brief Memory allocation flags
    *
-   * Used to batch similar allocations into the same
-   * set of chunks, which may help with fragmentation.
+   * Used as hints when picking a VMA allocation strategy /
+   * priority. VMA does its own chunk sub-allocation, so these
+   * no longer gate which chunk an allocation can land in the
+   * way the old free-list allocator's hints did; they now only
+   * influence VMA allocation priority (VK_EXT_memory_priority)
+   * and pooling behaviour.
    */
   enum class DxvkMemoryFlag : uint32_t {
     Small             = 0,  ///< Small allocation
@@ -195,106 +95,167 @@ namespace dxvk {
   };
 
   using DxvkMemoryFlags = Flags<DxvkMemoryFlag>;
-  
-  
+
+
   /**
-   * \brief Memory chunk
-   * 
-   * A single chunk of memory that provides a
-   * sub-allocator. This is not thread-safe.
+   * \brief Coarse allocation-lifetime categories
+   *
+   * Each category gets its own set of VMA pools (one pool per Vulkan
+   * memory type actually used within that category), each with a block
+   * size tuned for how that category behaves, instead of every resource
+   * in the app sharing one pile of generic blocks:
+   *  - Small: high churn, short-lived, small allocations -> small blocks,
+   *    so creating a fresh block is cheap and doesn't waste much space.
+   *  - Resident: long-lived GPU-priority resources (textures, RTs, big
+   *    buffers) -> large blocks, packed tightly since they stick around.
+   *  - Generic: everything else (host-visible staging, unclassified).
    */
-  class DxvkMemoryChunk : public RcObject {
-    
+  enum class DxvkMemoryPoolCategory : uint32_t {
+    Small    = 0,
+    Resident = 1,
+    Generic  = 2,
+  };
+
+  constexpr uint32_t DxvkMemoryPoolCategoryCount = 3;
+
+
+  /**
+   * \brief Memory slice
+   *
+   * Wraps a single VMA allocation (\c VmaAllocation). Memory is
+   * returned to VMA automatically via \c vmaFreeMemory once the
+   * last reference to the slice goes out of scope.
+   */
+  class DxvkMemory {
+    friend class DxvkMemoryAllocator;
   public:
-    
-    DxvkMemoryChunk(
+
+    DxvkMemory();
+    DxvkMemory(
             DxvkMemoryAllocator*  alloc,
-            DxvkMemoryType*       type,
-            DxvkDeviceMemory      memory,
-            DxvkMemoryFlags       m_hints);
-    
-    ~DxvkMemoryChunk();
+            VmaAllocation         allocation,
+            VkDeviceMemory        memory,
+            VkDeviceSize          offset,
+            VkDeviceSize          length,
+            void*                 mapPtr,
+            bool                  isRaw = false);
+    DxvkMemory             (DxvkMemory&& other);
+    DxvkMemory& operator = (DxvkMemory&& other);
+    ~DxvkMemory();
 
     /**
-     * \brief Allocates memory from the chunk
-     * 
-     * On failure, this returns a slice with
-     * \c VK_NULL_HANDLE as the memory handle.
-     * \param [in] flags Requested memory type flags
-     * \param [in] size Number of bytes to allocate
-     * \param [in] align Required alignment
-     * \param [in] hints Memory category
-     * \returns The allocated memory slice
+     * \brief Memory object
+     *
+     * This information is required when
+     * binding memory to Vulkan objects.
+     * \returns Memory object
      */
-    DxvkMemory alloc(
-            VkMemoryPropertyFlags flags,
-            VkDeviceSize          size,
-            VkDeviceSize          align,
-            DxvkMemoryFlags       hints);
-    
-    /**
-     * \brief Frees memory
-     * 
-     * Returns a slice back to the chunk.
-     * Called automatically when a memory
-     * slice runs out of scope.
-     * \param [in] offset Slice offset
-     * \param [in] length Slice length
-     */
-    void free(
-            VkDeviceSize  offset,
-            VkDeviceSize  length);
+    VkDeviceMemory memory() const {
+      return m_memory;
+    }
 
     /**
-     * \brief Checks whether the chunk is being used
-     * \returns \c true if there are no allocations left
+     * \brief Offset into device memory
+     *
+     * This information is required when
+     * binding memory to Vulkan objects.
+     * \returns Offset into device memory
      */
-    bool isEmpty() const;
+    VkDeviceSize offset() const {
+      return m_offset;
+    }
 
     /**
-     * \brief Checks whether hints and flags of another chunk match
-     * \param [in] other The chunk to compare to
+     * \brief Pointer to mapped data
+     *
+     * \param [in] offset Byte offset
+     * \returns Pointer to mapped data
      */
-    bool isCompatible(const Rc<DxvkMemoryChunk>& other) const;
+    void* mapPtr(VkDeviceSize offset) const {
+      return reinterpret_cast<char*>(m_mapPtr) + offset;
+    }
+
+    /**
+     * \brief Returns length of memory allocated
+     *
+     * \returns Memory size
+     */
+    VkDeviceSize length() const {
+      return m_length;
+    }
+
+    /**
+     * \brief Checks whether the memory slice is defined
+     *
+     * \returns \c true if this slice points to actual device
+     *          memory (whether VMA-managed or raw), \c false
+     *          if it is undefined.
+     */
+    operator bool () const {
+      return m_memory != VK_NULL_HANDLE;
+    }
+
+    /**
+     * \brief Underlying VMA allocation handle
+     *
+     * Exposed in case callers need to pass it directly
+     * to other VMA functions (e.g. flush/invalidate).
+     * \c VK_NULL_HANDLE for raw (non-VMA) allocations,
+     * see \ref isRaw.
+     */
+    VmaAllocation allocation() const {
+      return m_allocation;
+    }
+
+    /**
+     * \brief Whether this slice bypasses VMA
+     *
+     * True for allocations that had to go through raw
+     * \c vkAllocateMemory instead of VMA — currently only
+     * shared/external memory (import/export), since VMA's
+     * public API has no way to carry the extra \c pNext
+     * chain (\c VkExportMemoryAllocateInfo /
+     * \c VkImportMemoryWin32HandleInfoKHR) those need.
+     */
+    bool isRaw() const {
+      return m_isRaw;
+    }
 
   private:
-    
-    struct FreeSlice {
-      VkDeviceSize offset;
-      VkDeviceSize length;
-    };
-    
-    DxvkMemoryAllocator*  m_alloc;
-    DxvkMemoryType*       m_type;
-    DxvkDeviceMemory      m_memory;
-    DxvkMemoryFlags       m_hints;
-    
-    std::vector<FreeSlice> m_freeList;
 
-    bool checkHints(DxvkMemoryFlags hints) const;
-    
+    DxvkMemoryAllocator*  m_alloc      = nullptr;
+    VmaAllocation         m_allocation = VK_NULL_HANDLE;
+    VkDeviceMemory        m_memory     = VK_NULL_HANDLE;
+    VkDeviceSize          m_offset     = 0;
+    VkDeviceSize          m_length     = 0;
+    void*                 m_mapPtr     = nullptr;
+    bool                  m_isRaw      = false;
+
+    void free();
+
   };
-  
-  
+
+
   /**
    * \brief Memory allocator
-   * 
-   * Allocates device memory for Vulkan resources.
-   * Memory objects will be destroyed automatically.
+   *
+   * Thin wrapper around the Vulkan Memory Allocator (VMA).
+   * VMA takes care of chunk sub-allocation, placement and
+   * memory budget tracking internally, so DXVK no longer
+   * needs its own free-list based chunk allocator.
    */
   class DxvkMemoryAllocator {
     friend class DxvkMemory;
-    friend class DxvkMemoryChunk;
 
     constexpr static VkDeviceSize SmallAllocationThreshold = 256 << 10;
   public:
-    
+
     DxvkMemoryAllocator(const DxvkDevice* device);
     ~DxvkMemoryAllocator();
-    
+
     /**
      * \brief Buffer-image granularity
-     * 
+     *
      * The granularity between linear and non-linear
      * resources in adjacent memory locations. See
      * section 11.6 of the Vulkan spec for details.
@@ -303,10 +264,10 @@ namespace dxvk {
     VkDeviceSize bufferImageGranularity() const {
       return m_devProps.limits.bufferImageGranularity;
     }
-    
+
     /**
      * \brief Allocates device memory
-     * 
+     *
      * \param [in] req Memory requirements
      * \param [in] dedAllocReq Dedicated allocation requirements
      * \param [in] dedAllocInfo Dedicated allocation info
@@ -320,79 +281,70 @@ namespace dxvk {
       const VkMemoryDedicatedAllocateInfo&    dedAllocInfo,
             VkMemoryPropertyFlags             flags,
             DxvkMemoryFlags                   hints);
-    
+
     /**
      * \brief Queries memory stats
-     * 
+     *
      * Returns the total amount of memory
-     * allocated and used for a given heap.
+     * allocated and used for a given heap,
+     * as reported by VMA's budget query.
      * \param [in] heap Heap index
      * \returns Memory stats for this heap
      */
-    DxvkMemoryStats getMemoryStats(uint32_t heap) const {
-      return m_memHeaps[heap].stats;
+    DxvkMemoryStats getMemoryStats(uint32_t heap) const;
+
+    /**
+     * \brief Underlying VMA allocator handle
+     */
+    VmaAllocator handle() const {
+      return m_vma;
     }
-    
+
   private:
 
     const Rc<vk::DeviceFn>                 m_vkd;
     const DxvkDevice*                      m_device;
     const VkPhysicalDeviceProperties       m_devProps;
     const VkPhysicalDeviceMemoryProperties m_memProps;
-    
-    dxvk::mutex                                     m_mutex;
-    std::array<DxvkMemoryHeap, VK_MAX_MEMORY_HEAPS> m_memHeaps;
-    std::array<DxvkMemoryType, VK_MAX_MEMORY_TYPES> m_memTypes;
+
+    VmaAllocator m_vma = VK_NULL_HANDLE;
+
+    // Restored after testing: removing this made things noticeably worse
+    // (severe hitching, near-crashes) rather than better. VMA's internal
+    // per-pool locking is fine for correctness, but without any throttling
+    // here, bursts of concurrent vkAllocateMemory calls from multiple
+    // threads at once (render thread + streaming/loader threads all
+    // needing fresh blocks at the same moment) appear to overwhelm the
+    // driver/kernel far worse than a single serialized queue does. Keeping
+    // the mutex trades a bit of contention for actual stability.
+    dxvk::mutex m_mutex;
+
+    // One pool cache per category (see DxvkMemoryPoolCategory), keyed by
+    // Vulkan memory type index within that category. Only ever touched
+    // from inside tryAlloc(), which always runs under m_mutex, so this
+    // doesn't need its own lock.
+    std::array<std::unordered_map<uint32_t, VmaPool>, DxvkMemoryPoolCategoryCount> m_pools;
+
+    VmaPool findOrCreatePool(
+            DxvkMemoryPoolCategory           category,
+            uint32_t                         memTypeIndex,
+      const VmaAllocationCreateInfo&         createInfoTemplate);
 
     DxvkMemory tryAlloc(
       const VkMemoryRequirements*             req,
-      const VkMemoryDedicatedAllocateInfo*    dedAllocInfo,
+      const VkMemoryDedicatedRequirements&    dedAllocReq,
+      const VkMemoryDedicatedAllocateInfo&    dedAllocInfo,
             VkMemoryPropertyFlags             flags,
             DxvkMemoryFlags                   hints);
-    
-    DxvkMemory tryAllocFromType(
-            DxvkMemoryType*                   type,
-            VkMemoryPropertyFlags             flags,
-            VkDeviceSize                      size,
-            VkDeviceSize                      align,
-            DxvkMemoryFlags                   hints,
-      const VkMemoryDedicatedAllocateInfo*    dedAllocInfo);
-    
-    DxvkDeviceMemory tryAllocDeviceMemory(
-            DxvkMemoryType*                   type,
-            VkMemoryPropertyFlags             flags,
-            VkDeviceSize                      size,
-            DxvkMemoryFlags                   hints,
-      const VkMemoryDedicatedAllocateInfo*    dedAllocInfo);
-    
-    void free(
-      const DxvkMemory&           memory);
-    
-    void freeChunkMemory(
-            DxvkMemoryType*       type,
-            DxvkMemoryChunk*      chunk,
-            VkDeviceSize          offset,
-            VkDeviceSize          length);
-    
-    void freeDeviceMemory(
-            DxvkMemoryType*       type,
-            DxvkDeviceMemory      memory);
-    
-    VkDeviceSize pickChunkSize(
-            uint32_t              memTypeId,
-            DxvkMemoryFlags       hints) const;
 
-    bool shouldFreeChunk(
-      const DxvkMemoryType*       type,
-      const Rc<DxvkMemoryChunk>&  chunk) const;
-
-    bool shouldFreeEmptyChunks(
-      const DxvkMemoryHeap*       heap,
-            VkDeviceSize          allocationSize) const;
-
-    void freeEmptyChunks(
-      const DxvkMemoryHeap*       heap);
+    // Bypasses VMA entirely: used only when dedAllocInfo carries an extra
+    // pNext chain (shared/external memory) that VMA's public API can't
+    // be handed. See the comment at the top of tryAlloc() in the .cpp.
+    DxvkMemory tryAllocRaw(
+      const VkMemoryRequirements*             req,
+      const VkMemoryDedicatedAllocateInfo&    dedAllocInfo,
+            VkMemoryPropertyFlags             flags);
 
   };
-  
+
 }
