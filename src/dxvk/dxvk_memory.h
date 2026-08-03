@@ -31,7 +31,7 @@
   #define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
 #endif
 
-#include "../vulkan/vulkan_vma.h" // = vk_mem_alloc.h
+#include "../vulkan/vk_mem_alloc.h" // = vk_mem_alloc.h
 
 namespace dxvk {
 
